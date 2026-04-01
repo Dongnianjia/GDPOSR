@@ -1,19 +1,3 @@
-"""
-NAOSD.py  —  Stage-1 融合基础模型
-路径: /private/home/wuhao/dnj/GDPO-main/GDPOSR/modelfile/NAOSD.py
-
-核心修复（相对于上一版）：
-  1. 不再预设 SD21_BLOCK_CHANNELS，改为在 __init__ 时
-     通过 _probe_and_build_adapter() 动态探测每个 block 的真实输出 channel，
-     并据此构建 LazyFusionConditionAdapter，完全规避 channel 不匹配问题。
-  2. VAE encode 对象是 GT (c_t=x_tgt)，不是 masked 均值。
-  3. unet_input = [latent_noisy(4ch) | xa_lat(3ch) | xb_lat(3ch)] = 10ch。
-  4. FusionConditionAdapter zero-init，训练初期不扰动主干。
-  5. CrossAttentionSpatial 含 NaN 防护（clamp + float32 softmax）。
-  6. 注入策略：每个 down_block / mid_block / up_block 各注入一次（共9次），
-     与 probe 逻辑严格对应。
-"""
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
