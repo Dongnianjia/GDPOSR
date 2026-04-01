@@ -1,13 +1,3 @@
-"""
-inference_fusion.py  —  Stage-1.5 IR-VIS 融合推理脚本
-路径: /private/home/wuhao/dnj/GDPO-main/GDPOSR/inferences/inference_fusion.py
-
-推理方式：DDIM 20步，t_start=ddim.timesteps[0]（正确起始点）
-
-用法:
-  bash inferences/run_inference.sh model_final.pkl 20
-"""
-
 import os
 import sys
 import argparse
