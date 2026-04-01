@@ -1,19 +1,3 @@
-"""
-train_NAOSD.py  —  Stage-1 训练脚本（Mask-DiFuser 损失版）
-路径: /private/home/wuhao/dnj/GDPO-main/GDPOSR/train/train_NAOSD.py
-
-损失函数改为 Mask-DiFuser 论文公式(18)的5项损失：
-  L = L_diff + λ1*L_pix + λ2*L_ssim + λ3*L_per + λ4*L_col
-  λ1=0.05, λ2=0.05, λ3=0.1, λ4=1.0
-
-其中 L_diff 是最关键的改动：
-  原来：固定 t=999，只做 one-step 监督
-  现在：随机采样 t∈[0,T]，在所有时间步上监督噪声预测
-  这让模型学到完整的扩散生成先验，而不只是 t=999 这一刀
-
-模型结构（NAOSD.py）不需要改动。
-"""
-
 import os
 import sys
 import torch
