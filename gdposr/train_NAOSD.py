@@ -30,15 +30,13 @@ from my_utils.training_utils_realsr import parse_args_realsr_training, PairedSRO
 # ══════════════════════════════════════════════
 
 def loss_pixel(x_pred, x_gt):
-    """L_pix: 像素 L2，约束 x̂0 vs x0"""
     return F.mse_loss(x_pred.float(), x_gt.float())
 
 
 def loss_ssim(x_pred, x_gt):
-    """L_ssim: 结构相似性损失"""
     x_pred = x_pred.float()
     x_gt   = x_gt.float()
-    C1, C2 = 0.01 ** 2, 0.03 ** 2
+    C1, C2 = 0.01**2, 0.03**2
     mu_p  = F.avg_pool2d(x_pred, 11, 1, 5)
     mu_g  = F.avg_pool2d(x_gt,   11, 1, 5)
     mu_p2, mu_g2, mu_pg = mu_p*mu_p, mu_g*mu_g, mu_p*mu_g
@@ -51,7 +49,6 @@ def loss_ssim(x_pred, x_gt):
 
 
 class VGGPerceptual(nn.Module):
-    """L_per: VGG 感知损失（relu1_2, relu2_2, relu3_3）"""
     def __init__(self):
         super().__init__()
         vgg = torchvision.models.vgg16(
@@ -67,7 +64,6 @@ class VGGPerceptual(nn.Module):
             torch.tensor([0.229, 0.224, 0.225]).view(1,3,1,1))
 
     def forward(self, x_pred, x_gt):
-        # 输入是 [-1,1]，先转 [0,1] 再 ImageNet normalize
         x_pred = ((x_pred.float() + 1) / 2 - self.mean) / self.std
         x_gt   = ((x_gt.float()   + 1) / 2 - self.mean) / self.std
         loss = 0.0
@@ -79,22 +75,27 @@ class VGGPerceptual(nn.Module):
 
 
 def loss_color(x_pred, x_gt):
-    """L_col: RGB 颜色向量余弦距离（Eq.17），最强颜色约束"""
+    """L_col: RGB 颜色向量余弦距离（Eq.17）"""
     pred_norm = F.normalize(x_pred.float(), p=2, dim=1)
     gt_norm   = F.normalize(x_gt.float(),   p=2, dim=1)
     return (1.0 - F.cosine_similarity(pred_norm, gt_norm, dim=1)).mean()
 
 
 # ══════════════════════════════════════════════
-# 验证推理（DDIM 多步，看真实 IR-VIS 融合效果）
+# 验证推理（DDIM，t_start=500 保守值）
 # ══════════════════════════════════════════════
 
 def run_val_fusion(net_unwrapped, step, output_dir, device,
-                   val_ir_path, val_vis_path, ddim_steps=20):
+                   val_ir_path, val_vis_path, ddim_steps=20,
+                   t_start_val=500):
+    """
+    t_start_val=500：推理时只加噪到 t=500（不是最大值 980+）
+    保留更多原始空间结构，显著抑制形变/位移
+    """
     if val_ir_path is None or val_vis_path is None:
         return
     if not (os.path.isfile(val_ir_path) and os.path.isfile(val_vis_path)):
-        print(f"[val] 找不到验证图，跳过")
+        print("[val] 找不到验证图，跳过")
         return
 
     from diffusers import DDIMScheduler
@@ -115,23 +116,25 @@ def run_val_fusion(net_unwrapped, step, output_dir, device,
                 subfolder="scheduler")
             ddim.set_timesteps(ddim_steps, device=device)
 
-            # 加噪起点：VIS latent 加噪到第一步时间步
+            # VIS latent 加噪到 t_start_val（保守值，保留空间结构）
             latent = net_unwrapped.vae.encode(x_vis).latent_dist.sample()
             latent = latent * net_unwrapped.vae.config.scaling_factor
             noise  = torch.randn_like(latent)
-            t_start = ddim.timesteps[0]
-            latent  = ddim.add_noise(latent, noise,
-                                     torch.tensor([t_start], device=device))
+            t_start_tensor = torch.tensor([t_start_val], device=device)
+            latent = ddim.add_noise(latent, noise, t_start_tensor)
 
             caption = net_unwrapped.encode_prompt([""])
             fa, fb, f_f = net_unwrapped._extract_fusion_cond(x_ir, x_vis)
 
+            # 只走 t <= t_start_val 的去噪步
             for ts in ddim.timesteps:
+                if ts > t_start_val:
+                    continue
                 lh, lw = latent.shape[-2:]
-                xa_lat = F.interpolate(x_ir,  (lh,lw), mode="bilinear", align_corners=False)
-                xb_lat = F.interpolate(x_vis, (lh,lw), mode="bilinear", align_corners=False)
+                xa_lat = F.interpolate(x_ir,  (lh, lw), mode="bilinear", align_corners=False)
+                xb_lat = F.interpolate(x_vis, (lh, lw), mode="bilinear", align_corners=False)
                 unet_input = torch.cat([latent, xa_lat, xb_lat], dim=1)
-                t_tensor = torch.tensor([ts], device=device).long()
+                t_tensor   = torch.tensor([ts], device=device).long()
                 noise_pred = net_unwrapped._unet_forward(
                     unet_input, caption, fa, fb, f_f, t=t_tensor)
                 latent = ddim.step(noise_pred, ts, latent).prev_sample
@@ -208,7 +211,7 @@ def main(args):
     if args.allow_tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
 
-    # ── VAE adapter 激活 ────────────────────────
+    # ── VAE adapter ─────────────────────────────
     if args.use_vae_encode_lora and args.use_vae_decode_lora:
         net.vae.set_adapter(["default_encoder", "default_decoder"])
     elif args.use_vae_encode_lora:
@@ -220,7 +223,7 @@ def main(args):
             net.vae.disable_adapters()
     net.unet.set_adapter(["default_encoder", "default_decoder", "default_others"])
 
-    # ── 感知损失（VGG frozen）───────────────────
+    # ── 感知损失 ─────────────────────────────────
     vgg_loss = VGGPerceptual().cuda()
 
     # ── optimizer ───────────────────────────────
@@ -259,7 +262,6 @@ def main(args):
         persistent_workers=(args.dataloader_num_workers > 0),
     )
 
-    # ── accelerator prepare ─────────────────────
     net, optimizer, dl_train, lr_scheduler = accelerator.prepare(
         net, optimizer, dl_train, lr_scheduler)
     vgg_loss = accelerator.prepare(vgg_loss)
@@ -277,7 +279,6 @@ def main(args):
     lambda_per  = 0.1
     lambda_col  = 1.0
 
-    # ── training loop ───────────────────────────
     global_step = 0
     nan_count   = 0
     train_iter  = iter(dl_train)
@@ -292,36 +293,36 @@ def main(args):
 
         with accelerator.accumulate(net):
 
-            x_tgt = batch["HR"]     # (B,3,H,W) GT，[-1,1]
-            xA    = batch["LR_A"]   # (B,3,H,W) masked A
-            xB    = batch["LR_B"]   # (B,3,H,W) masked B
-            B     = x_tgt.shape[0]
+            x_tgt = batch["HR"]    # GT
+            xA    = batch["LR_A"]  # masked A
+            xB    = batch["LR_B"]  # masked B
 
-            # ── Mask-DiFuser 正确训练范式 ─────────────
-            # t 随机采样在 forward_train 内部完成
-            eps_pred, eps_target, x0_hat, _ = \
+            # ── Mask-DiFuser 训练范式 ─────────────
+            eps_pred, eps_target, x0_hat, t_used = \
                 accelerator.unwrap_model(net).forward_train(
                     x0=x_tgt, xA=xA, xB=xB
                 )
 
-            # ── 5项损失（Eq.18）──────────────────────
-            # L_diff: 随机时间步噪声预测 MSE（真正的 diffusion loss）
-            l_diff = F.mse_loss(eps_pred.float(), eps_target.float())
+            # ── t_weight：大 t 时 x̂0 不准，降低像素级 loss 权重 ──
+            # t=0   → weight=1.0（完全约束像素）
+            # t=999 → weight=0.1（几乎只训 L_diff）
+            t_weight = (1.0 - t_used.float() / 1000.0).clamp(0.1, 1.0).mean()
 
-            # L_pix/L_ssim/L_per/L_col: 全部约束 (x̂0, x0)
-            # x̂0 由 predict_x0_from_noise 反推，与 GT 在像素空间对齐
+            # ── 5项损失（Eq.18）──────────────────
+            l_diff = F.mse_loss(eps_pred.float(), eps_target.float())
             l_pix  = loss_pixel(x0_hat, x_tgt)
             l_ssim = loss_ssim(x0_hat, x_tgt)
             l_per  = vgg_loss(x0_hat, x_tgt)
             l_col  = loss_color(x0_hat, x_tgt)
 
+            # L_diff 不加权（全时间步训）
+            # 像素级 loss 乘 t_weight（大 t 时降权）
             loss = (lambda_diff * l_diff +
-                    lambda_pix  * l_pix  +
-                    lambda_ssim * l_ssim +
-                    lambda_per  * l_per  +
-                    lambda_col  * l_col)
+                    t_weight * (lambda_pix  * l_pix  +
+                                lambda_ssim * l_ssim +
+                                lambda_per  * l_per  +
+                                lambda_col  * l_col))
 
-            # ── NaN 防护 ─────────────────────────────
             if not torch.isfinite(loss):
                 nan_count += 1
                 print(f"[step {global_step}] non-finite loss ({nan_count}/50), skip")
@@ -351,39 +352,46 @@ def main(args):
                     "loss_ssim": l_ssim.detach().item(),
                     "loss_per":  l_per.detach().item(),
                     "loss_col":  l_col.detach().item(),
+                    "t_weight":  t_weight.detach().item(),
                     "lr":        lr_scheduler.get_last_lr()[0],
                 }
                 progress_bar.set_postfix(
                     loss=f"{loss.item():.3f}",
                     col=f"{l_col.item():.3f}",
-                    per=f"{l_per.item():.3f}",
+                    tw=f"{t_weight.item():.2f}",
                 )
                 accelerator.log(logs, step=global_step)
 
                 if global_step % args.checkpointing_steps == 0:
 
-                    # ── adapter 激活监控 ──────────────
                     try:
                         adapter_w = accelerator.unwrap_model(net) \
                             .cond_adapter.fuse[4][-1].weight.abs().mean().item()
-                        print(f"[step {global_step}] adapter_w: {adapter_w:.6f}")
-                        accelerator.log({"adapter_w": adapter_w}, step=global_step)
+                        direct_w  = accelerator.unwrap_model(net) \
+                            .cond_adapter.direct_proj[4][-1].weight.abs().mean().item()
+                        print(f"[step {global_step}] "
+                              f"adapter_attn_w={adapter_w:.6f}  "
+                              f"adapter_direct_w={direct_w:.6f}")
+                        accelerator.log({
+                            "adapter_attn_w":   adapter_w,
+                            "adapter_direct_w": direct_w,
+                        }, step=global_step)
                     except Exception:
                         pass
 
-                    # ── 训练预览图：masked_A | x̂0 | GT ─
+                    # 训练预览：masked_A | x̂0 | GT
                     train_vis = torch.cat([
                         xA[:1].detach().cpu().float(),
                         x0_hat[:1].detach().cpu().float(),
                         x_tgt[:1].detach().cpu().float(),
                     ], dim=-1)
                     save_image(
-                        (train_vis.clamp(-1,1) + 1) / 2,
+                        (train_vis.clamp(-1, 1) + 1) / 2,
                         os.path.join(args.output_dir, "eval",
                                      f"train_step_{global_step:06d}.png"),
                     )
 
-                    # ── IR-VIS 融合验证（DDIM 20步）────
+                    # IR-VIS 融合验证（DDIM 20步，t_start=500）
                     run_val_fusion(
                         net_unwrapped=accelerator.unwrap_model(net),
                         step=global_step,
@@ -392,9 +400,9 @@ def main(args):
                         val_ir_path=VAL_IR_PATH,
                         val_vis_path=VAL_VIS_PATH,
                         ddim_steps=20,
+                        t_start_val=500,
                     )
 
-                    # ── checkpoint ────────────────────
                     outf = os.path.join(args.output_dir, "checkpoints",
                                         f"model_{global_step:06d}.pkl")
                     accelerator.unwrap_model(net).save_model(outf)
