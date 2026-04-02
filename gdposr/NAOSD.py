@@ -28,8 +28,8 @@ def initialize_vae(rank, return_lora_module_names=False,
     vae.train()
 
     enc_mods, dec_mods, oth_mods = [], [], []
-    patterns = ["conv1","conv2","conv_in","conv_shortcut","conv","conv_out",
-                "to_k","to_q","to_v","to_out.0"]
+    patterns = ["conv1", "conv2", "conv_in", "conv_shortcut", "conv", "conv_out",
+                "to_k", "to_q", "to_v", "to_out.0"]
     for n, _ in vae.named_parameters():
         if "bias" in n or "norm" in n:
             continue
@@ -58,36 +58,26 @@ def initialize_vae(rank, return_lora_module_names=False,
 
 def initialize_unet_sr(rank, return_lora_module_names=False,
                         pretrained_model_name_or_path=None, args=None):
-    """
-    扩展 conv_in 为 10 通道：
-        前 4ch  → 复制 SD 原权重（latent 通道，保留生成先验）
-        后 6ch  → 置零（训练初期不引入扰动）
-    """
+    """conv_in 扩展为 10 通道：前 4ch 复制 SD 权重，后 6ch 置零"""
     unet = UNet2DConditionModel.from_pretrained(
         pretrained_model_name_or_path, subfolder="unet")
 
     old = unet.conv_in
-    new_conv = nn.Conv2d(
-        in_channels=10,
-        out_channels=old.out_channels,
-        kernel_size=old.kernel_size,
-        stride=old.stride,
-        padding=old.padding,
-    )
+    new_conv = nn.Conv2d(10, old.out_channels,
+                         old.kernel_size, old.stride, old.padding)
     with torch.no_grad():
         new_conv.weight.zero_()
-        new_conv.weight[:, :4, :, :].copy_(old.weight.data)
+        new_conv.weight[:, :4].copy_(old.weight.data)
         if old.bias is not None:
             new_conv.bias.copy_(old.bias.data)
     unet.conv_in = new_conv
-
     unet.requires_grad_(False)
     unet.train()
 
     enc_mods, dec_mods, oth_mods = [], [], []
-    patterns = ["to_k","to_q","to_v","to_out.0","conv","conv1","conv2",
-                "conv_in","conv_shortcut","conv_out","proj_out","proj_in",
-                "ff.net.2","ff.net.0.proj"]
+    patterns = ["to_k", "to_q", "to_v", "to_out.0", "conv", "conv1", "conv2",
+                "conv_in", "conv_shortcut", "conv_out", "proj_out", "proj_in",
+                "ff.net.2", "ff.net.0.proj"]
     for n, _ in unet.named_parameters():
         if "bias" in n or "norm" in n:
             continue
@@ -115,18 +105,10 @@ def initialize_unet_sr(rank, return_lora_module_names=False,
 
 
 # ══════════════════════════════════════════════
-# FusionConditionAdapter（probe 后构建）
+# FusionConditionAdapter
 # ══════════════════════════════════════════════
 
 class FusionConditionAdapter(nn.Module):
-    """
-    在每个 UNet block（down/mid/up）之后注入 fusion 条件。
-    channel_list 由 _probe_and_build_adapter() 动态决定，不预设。
-
-    注入公式：h_new = h + delta
-    delta 来自 fuse([h, ff_proj, cross_attn(h,fa), cross_attn(h,fb)])
-    fuse 最后一层 Conv zero-init，训练初期 delta≈0。
-    """
     def __init__(self, channel_list, cond_ch: int = 128, ff_ch: int = 64):
         super().__init__()
         self.channel_list = channel_list
@@ -138,7 +120,6 @@ class FusionConditionAdapter(nn.Module):
 
         for ch in channel_list:
             g = min(32, ch)
-
             self.ff_proj.append(nn.Sequential(
                 nn.Conv2d(ff_ch, ch, 1),
                 nn.GroupNorm(g, ch),
@@ -151,7 +132,7 @@ class FusionConditionAdapter(nn.Module):
                 nn.Conv2d(ch * 4, ch, 3, 1, 1),
                 nn.GroupNorm(g, ch),
                 nn.SiLU(),
-                nn.Conv2d(ch, ch, 1),   # ← zero-init
+                nn.Conv2d(ch, ch, 1),   # zero-init → delta≈0 at start
             )
             nn.init.zeros_(fuse_block[-1].weight)
             nn.init.zeros_(fuse_block[-1].bias)
@@ -159,7 +140,7 @@ class FusionConditionAdapter(nn.Module):
 
     def forward(self, h, idx, fa, fb, f_f):
         H, W = h.shape[-2:]
-        ff   = F.interpolate(f_f, size=(H, W), mode="bilinear", align_corners=False)
+        ff   = F.interpolate(f_f, (H, W), mode="bilinear", align_corners=False)
         ff   = self.ff_proj[idx](ff)
         za   = self.fa_attn[idx](h, fa)
         zb   = self.fb_attn[idx](h, fb)
@@ -168,7 +149,7 @@ class FusionConditionAdapter(nn.Module):
 
 
 # ══════════════════════════════════════════════
-# NAOSD  —  Stage-1 主类
+# NAOSD
 # ══════════════════════════════════════════════
 
 class NAOSD(nn.Module):
@@ -186,11 +167,9 @@ class NAOSD(nn.Module):
             args.pretrained_model_name_or_path, subfolder="scheduler")
         self.args = args
 
-        # ── fusion encoder modules ────────────
         self.semantic_encoder = SemanticEncoder(3, 128, 8, 4, dropout=0.1)
         self.content_encoder  = ContentEncoder(3, 128, 64)
 
-        # ── base models ───────────────────────
         vae, lora_vae_enc, lora_vae_dec, lora_vae_oth = initialize_vae(
             rank=args.lora_rank_vae,
             pretrained_model_name_or_path=args.pretrained_model_name_or_path,
@@ -214,41 +193,34 @@ class NAOSD(nn.Module):
         self.lora_unet_modules_decoder = lora_unet_dec
         self.lora_unet_others          = lora_unet_oth
 
-        # ── 动态探测 channel，构建 adapter ────
         channel_list = self._probe_channels()
         self.cond_adapter = FusionConditionAdapter(
             channel_list=channel_list, cond_ch=128, ff_ch=64)
 
-        # ── load checkpoint ───────────────────
         if getattr(args, "pretrained_path", None) is not None:
             print("==> loading pretrained:", args.pretrained_path)
             sd = torch.load(args.pretrained_path, map_location="cpu")
             self.load_ckpt_from_state_dict(sd)
 
-        # ── move to cuda ──────────────────────
         self.unet.cuda()
         self.vae.cuda()
         self.semantic_encoder.cuda()
         self.content_encoder.cuda()
         self.cond_adapter.cuda()
 
+        # default timesteps for one-step inference
         self.timesteps      = torch.tensor([args.time_step],       device="cuda").long()
         self.timestepsnoise = torch.tensor([args.time_step_noise], device="cuda").long()
 
     # ──────────────────────────────────────────
-    # probe：干跑一次 UNet，每个 block 结束后记录 channel
+    # probe
     # ──────────────────────────────────────────
     @torch.no_grad()
     def _probe_channels(self):
-        """
-        注入策略：down_block × 4 + mid × 1 + up_block × 4 = 9 个注入点。
-        每个注入点记录 block 主输出的 channel 数。
-        """
         unet = self.unet
         was_training = unet.training
         unet.eval()
 
-        # SD1.5 text embedding dim = 768
         dummy_input = torch.zeros(1, 10, 64, 64)
         dummy_text  = torch.zeros(1, 77, 768)
 
@@ -257,7 +229,7 @@ class NAOSD(nn.Module):
         emb    = unet.time_embedding(t_emb)
 
         channel_list = []
-        down_block_res_samples = (sample,)
+        down_block_res = (sample,)
 
         for down in unet.down_blocks:
             if getattr(down, "has_cross_attention", False):
@@ -266,26 +238,25 @@ class NAOSD(nn.Module):
             else:
                 sample, res = down(hidden_states=sample, temb=emb)
             channel_list.append(sample.shape[1])
-            down_block_res_samples += res
+            down_block_res += res
 
         if unet.mid_block is not None:
             sample = unet.mid_block(sample, emb, encoder_hidden_states=dummy_text)
             channel_list.append(sample.shape[1])
 
         for up in unet.up_blocks:
-            res_samples = down_block_res_samples[-len(up.resnets):]
-            down_block_res_samples = down_block_res_samples[:-len(up.resnets)]
+            res = down_block_res[-len(up.resnets):]
+            down_block_res = down_block_res[:-len(up.resnets)]
             if getattr(up, "has_cross_attention", False):
                 sample = up(hidden_states=sample, temb=emb,
-                            res_hidden_states_tuple=res_samples,
+                            res_hidden_states_tuple=res,
                             encoder_hidden_states=dummy_text)
             else:
                 sample = up(hidden_states=sample, temb=emb,
-                            res_hidden_states_tuple=res_samples)
+                            res_hidden_states_tuple=res)
             channel_list.append(sample.shape[1])
 
-        print(f"[NAOSD] probe channels ({len(channel_list)} injection points): {channel_list}")
-
+        print(f"[NAOSD] probe channels ({len(channel_list)} pts): {channel_list}")
         if was_training:
             unet.train()
         return channel_list
@@ -306,7 +277,6 @@ class NAOSD(nn.Module):
         self.semantic_encoder.train()
         self.content_encoder.train()
         self.cond_adapter.train()
-
         for n, p in self.unet.named_parameters():
             p.requires_grad = ("lora" in n or "conv_in" in n)
         for n, p in self.vae.named_parameters():
@@ -316,7 +286,7 @@ class NAOSD(nn.Module):
                 p.requires_grad = True
 
     # ──────────────────────────────────────────
-    # helpers
+    # encode_prompt
     # ──────────────────────────────────────────
 
     @torch.no_grad()
@@ -330,95 +300,178 @@ class NAOSD(nn.Module):
         ).input_ids
         return self.text_encoder(ids.to(self.text_encoder.device))[0]
 
-    def _prepare_unet_input(self, extra_cond, latent_noisy):
-        xa = extra_cond[:, :3]
-        xb = extra_cond[:, 3:6]
+    # ──────────────────────────────────────────
+    # _extract_fusion_cond
+    # ──────────────────────────────────────────
 
-        fa  = self.semantic_encoder(xa)
-        fb  = self.semantic_encoder(xb)
-        f_f = self.content_encoder(xa, xb)
+    def _extract_fusion_cond(self, xA, xB):
+        """从 xA, xB 提取 fa, fb, f_f"""
+        fa  = self.semantic_encoder(xA)
+        fb  = self.semantic_encoder(xB)
+        f_f = self.content_encoder(xA, xB)
+        return fa, fb, f_f
 
-        lh, lw = latent_noisy.shape[-2:]
-        xa_lat = F.interpolate(xa, size=(lh, lw), mode="bilinear", align_corners=False)
-        xb_lat = F.interpolate(xb, size=(lh, lw), mode="bilinear", align_corners=False)
+    # ──────────────────────────────────────────
+    # _unet_forward  ← 支持任意时间步 t
+    # ──────────────────────────────────────────
 
-        unet_input = torch.cat([latent_noisy, xa_lat, xb_lat], dim=1)  # (B,10,h,w)
-        return fa, fb, f_f, unet_input
-
-    def _unet_forward(self, unet_input, caption_enc, fa, fb, f_f):
+    def _unet_forward(self, unet_input, caption_enc, fa, fb, f_f, t=None):
         """
-        注入顺序与 _probe_channels() 完全对应：
-          idx 0~3 → down_blocks
-          idx 4   → mid_block
-          idx 5~8 → up_blocks
+        t: LongTensor (B,) 或 (1,)
+           训练时传随机时间步；推理时传 None，内部用 self.timesteps
         """
-        unet = self.unet
+        if t is None:
+            t = self.timesteps
 
+        unet   = self.unet
         sample = unet.conv_in(unet_input)
-        t_emb  = unet.time_proj(self.timesteps).to(sample.dtype)
-        emb    = unet.time_embedding(t_emb)
+
+        # time embedding 支持 batch 维或单值
+        if t.shape[0] == sample.shape[0]:
+            t_emb = unet.time_proj(t).to(sample.dtype)          # (B, 320)
+            emb   = unet.time_embedding(t_emb)                   # (B, 1280)
+        else:
+            # 单个时间步，广播
+            t_emb = unet.time_proj(t[:1]).to(sample.dtype)
+            emb   = unet.time_embedding(t_emb).expand(sample.shape[0], -1)
+
         enc_hs = caption_enc.to(sample.dtype)
 
         adapter_idx = 0
-        down_block_res_samples = (sample,)
+        down_block_res = (sample,)
 
-        # ── down ───────────────────────────────
         for down in unet.down_blocks:
             if getattr(down, "has_cross_attention", False):
                 sample, res = down(hidden_states=sample, temb=emb,
                                    encoder_hidden_states=enc_hs)
             else:
                 sample, res = down(hidden_states=sample, temb=emb)
-
             sample = self.cond_adapter(sample, adapter_idx, fa, fb, f_f)
             adapter_idx += 1
-            down_block_res_samples += res
+            down_block_res += res
 
-        # ── mid ────────────────────────────────
         if unet.mid_block is not None:
             sample = unet.mid_block(sample, emb, encoder_hidden_states=enc_hs)
             sample = self.cond_adapter(sample, adapter_idx, fa, fb, f_f)
             adapter_idx += 1
 
-        # ── up ─────────────────────────────────
         for up in unet.up_blocks:
-            res_samples = down_block_res_samples[-len(up.resnets):]
-            down_block_res_samples = down_block_res_samples[:-len(up.resnets)]
-
+            res = down_block_res[-len(up.resnets):]
+            down_block_res = down_block_res[:-len(up.resnets)]
             if getattr(up, "has_cross_attention", False):
                 sample = up(hidden_states=sample, temb=emb,
-                            res_hidden_states_tuple=res_samples,
+                            res_hidden_states_tuple=res,
                             encoder_hidden_states=enc_hs)
             else:
                 sample = up(hidden_states=sample, temb=emb,
-                            res_hidden_states_tuple=res_samples)
-
+                            res_hidden_states_tuple=res)
             sample = self.cond_adapter(sample, adapter_idx, fa, fb, f_f)
             adapter_idx += 1
 
-        # ── output ─────────────────────────────
         if unet.conv_norm_out is not None:
             sample = unet.conv_norm_out(sample)
             sample = unet.conv_act(sample)
-        sample = unet.conv_out(sample)
-        return sample
+        return unet.conv_out(sample)
 
     # ──────────────────────────────────────────
-    # forward
+    # forward_train  ← Mask-DiFuser 真正训练范式
+    # ──────────────────────────────────────────
+
+    def forward_train(self, x0, xA, xB, t=None):
+        """
+        Mask-DiFuser 训练范式（Eq.12-18）：
+          - x0:  GT 图像 (B,3,H,W), [-1,1]
+          - xA/xB: 两路互补 masked 图，作为 conditioning
+          - t:   时间步 LongTensor (B,)，None 时随机采样
+
+        返回：
+          eps_pred   - UNet 预测的噪声 (B,4,h,w)
+          eps_target - 加入的真实噪声 (B,4,h,w)
+          x0_hat     - 从噪声预测反推的 x0，在像素空间 [-1,1]（用于 L_pix/L_ssim/L_per/L_col）
+          latent_x0  - GT 的 latent（调试用）
+        """
+        B = x0.shape[0]
+
+        # 1. Encode GT → latent
+        with torch.no_grad():
+            latent_x0 = (self.vae.encode(x0).latent_dist.sample()
+                         * self.vae.config.scaling_factor)
+
+        # 2. 随机时间步
+        if t is None:
+            t = torch.randint(
+                0, self.sched2.config.num_train_timesteps,
+                (B,), device=x0.device
+            ).long()
+
+        # 3. 前向加噪
+        eps = torch.randn_like(latent_x0)
+        xt  = self.sched2.add_noise(latent_x0, eps, t)
+
+        # 4. 提取 fusion 条件（来自 masked 输入，不是 GT）
+        fa, fb, f_f = self._extract_fusion_cond(xA, xB)
+
+        # 5. 构造 UNet 输入：[xt(4ch) | xA_resized(3ch) | xB_resized(3ch)]
+        lh, lw = xt.shape[-2:]
+        xa_lat = F.interpolate(xA, (lh, lw), mode="bilinear", align_corners=False)
+        xb_lat = F.interpolate(xB, (lh, lw), mode="bilinear", align_corners=False)
+        unet_input = torch.cat([xt, xa_lat, xb_lat], dim=1)   # (B,10,h,w)
+
+        # 6. text embedding（空 prompt）
+        caption_enc = self.encode_prompt([""] * B)
+
+        # 7. UNet 预测噪声（传入随机 t）
+        eps_pred = self._unet_forward(unet_input, caption_enc, fa, fb, f_f, t=t)
+
+        # 8. predict_x0_from_noise（Eq.13）
+        #    x̂0 = (xt - sqrt(1-ᾱt) * eps_pred) / sqrt(ᾱt)
+        #    clamp(-5,5) 防止大时间步数值爆炸
+        alphas_cumprod = self.sched2.alphas_cumprod.to(x0.device)
+        alpha_t = alphas_cumprod[t].float()                # (B,)
+        while alpha_t.dim() < latent_x0.dim():
+            alpha_t = alpha_t.unsqueeze(-1)                # (B,1,1,1)
+
+        x0_hat_lat = (xt.float() - (1 - alpha_t).sqrt() * eps_pred.float()) \
+                     / alpha_t.sqrt()
+        x0_hat_lat = x0_hat_lat.clamp(-5, 5)
+
+        # 9. Decode → 像素空间
+        x0_hat = self.vae.decode(
+            x0_hat_lat / self.vae.config.scaling_factor
+        ).sample.clamp(-1, 1)
+
+        return eps_pred, eps, x0_hat, latent_x0
+
+    # ──────────────────────────────────────────
+    # forward  ← one-step 推理接口（保持原签名）
     # ──────────────────────────────────────────
 
     def forward(self, c_t, positive_prompt=None, negative_prompt=None,
                 args=None, extra_cond=None):
+        """
+        推理/验证用：one-step。
+        c_t: VIS 图（或 GT）作为 VAE encode 起点
+        extra_cond: (B,6,H,W) = [xA | xB]
+        """
         caption_enc     = self.encode_prompt(positive_prompt)
         neg_caption_enc = self.encode_prompt(negative_prompt)
 
-        # VAE encode GT
-        latent = self.vae.encode(c_t).latent_dist.sample() * self.vae.config.scaling_factor
-        noise        = torch.randn_like(latent)
+        latent      = (self.vae.encode(c_t).latent_dist.sample()
+                       * self.vae.config.scaling_factor)
+        noise       = torch.randn_like(latent)
         latent_noisy = self.sched2.add_noise(latent, noise, self.timestepsnoise)
 
-        fa, fb, f_f, unet_input = self._prepare_unet_input(extra_cond, latent_noisy)
-        model_pred = self._unet_forward(unet_input, caption_enc, fa, fb, f_f)
+        xA = extra_cond[:, :3]
+        xB = extra_cond[:, 3:6]
+        fa, fb, f_f = self._extract_fusion_cond(xA, xB)
+
+        lh, lw = latent_noisy.shape[-2:]
+        xa_lat = F.interpolate(xA, (lh, lw), mode="bilinear", align_corners=False)
+        xb_lat = F.interpolate(xB, (lh, lw), mode="bilinear", align_corners=False)
+        unet_input = torch.cat([latent_noisy, xa_lat, xb_lat], dim=1)
+
+        # 推理：t=None → 内部用 self.timesteps
+        model_pred = self._unet_forward(unet_input, caption_enc, fa, fb, f_f, t=None)
 
         x_denoised = self.sched.step(
             model_pred, self.timesteps, latent_noisy, return_dict=True
@@ -475,7 +528,6 @@ class NAOSD(nn.Module):
                 LoraConfig(r=sd["rank_unet"], init_lora_weights="gaussian",
                            target_modules=sd["unet_lora_others_modules"]),
                 adapter_name="default_others")
-
         if "state_dict_unet" in sd:
             for n, p in self.unet.named_parameters():
                 if n in sd["state_dict_unet"]:
@@ -491,7 +543,6 @@ class NAOSD(nn.Module):
                 LoraConfig(r=sd["rank_vae"], init_lora_weights="gaussian",
                            target_modules=sd["vae_lora_decoder_modules"]),
                 adapter_name="default_decoder")
-
         if "state_dict_vae" in sd:
             for n, p in self.vae.named_parameters():
                 if n in sd["state_dict_vae"]:
