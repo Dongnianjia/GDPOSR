@@ -1,520 +1,449 @@
+import os
+import sys
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+import torch.nn as nn
+import torchvision
+import transformers
+import diffusers
+import wandb
 
-from peft import LoraConfig
-from transformers import AutoTokenizer, CLIPTextModel
-from diffusers import AutoencoderKL, UNet2DConditionModel, DDPMScheduler
+from accelerate import Accelerator
+from accelerate.utils import set_seed, ProjectConfiguration
+from accelerate import DistributedDataParallelKwargs
+from diffusers.utils.import_utils import is_xformers_available
+from diffusers.optimization import get_scheduler
+from tqdm.auto import tqdm
+from pathlib import Path
+from PIL import Image
+import torchvision.transforms.functional as TF
+from torchvision.utils import save_image
 
-from .fusion_modules import ContentEncoder, SemanticEncoder, CrossAttentionSpatial
+sys.path.append("/private/home/wuhao/dnj/GDPO-main/GDPOSR")
 
-
-# ══════════════════════════════════════════════
-# helpers
-# ══════════════════════════════════════════════
-
-def make_1step_sched(pretrained_model_path: str):
-    sched = DDPMScheduler.from_pretrained(pretrained_model_path, subfolder="scheduler")
-    sched.set_timesteps(1, device="cuda")
-    sched.alphas_cumprod = sched.alphas_cumprod.cuda()
-    return sched
-
-
-def initialize_vae(rank, return_lora_module_names=False,
-                   pretrained_model_name_or_path=None):
-    vae = AutoencoderKL.from_pretrained(
-        pretrained_model_name_or_path, subfolder="vae")
-    vae.requires_grad_(False)
-    vae.train()
-
-    enc_mods, dec_mods, oth_mods = [], [], []
-    patterns = ["conv1", "conv2", "conv_in", "conv_shortcut", "conv", "conv_out",
-                "to_k", "to_q", "to_v", "to_out.0"]
-    for n, _ in vae.named_parameters():
-        if "bias" in n or "norm" in n:
-            continue
-        for pat in patterns:
-            if pat in n and "encoder" in n:
-                enc_mods.append(n.replace(".weight", "")); break
-            elif pat in n and "decoder" in n:
-                dec_mods.append(n.replace(".weight", "")); break
-            elif "quant_conv" in n and "post_quant_conv" not in n:
-                enc_mods.append(n.replace(".weight", "")); break
-            elif "post_quant_conv" in n:
-                dec_mods.append(n.replace(".weight", "")); break
-            elif pat in n:
-                oth_mods.append(n.replace(".weight", "")); break
-
-    vae.add_adapter(LoraConfig(r=rank, init_lora_weights="gaussian",
-                               target_modules=enc_mods),
-                    adapter_name="default_encoder")
-    vae.add_adapter(LoraConfig(r=rank, init_lora_weights="gaussian",
-                               target_modules=dec_mods),
-                    adapter_name="default_decoder")
-    if return_lora_module_names:
-        return vae, enc_mods, dec_mods, oth_mods
-    return vae
-
-
-def initialize_unet_sr(rank, return_lora_module_names=False,
-                        pretrained_model_name_or_path=None, args=None):
-    """conv_in 扩展为 10 通道：前 4ch 复制 SD 权重，后 6ch 置零"""
-    unet = UNet2DConditionModel.from_pretrained(
-        pretrained_model_name_or_path, subfolder="unet")
-
-    old = unet.conv_in
-    new_conv = nn.Conv2d(10, old.out_channels,
-                         old.kernel_size, old.stride, old.padding)
-    with torch.no_grad():
-        new_conv.weight.zero_()
-        new_conv.weight[:, :4].copy_(old.weight.data)
-        if old.bias is not None:
-            new_conv.bias.copy_(old.bias.data)
-    unet.conv_in = new_conv
-    unet.requires_grad_(False)
-    unet.train()
-
-    enc_mods, dec_mods, oth_mods = [], [], []
-    patterns = ["to_k", "to_q", "to_v", "to_out.0", "conv", "conv1", "conv2",
-                "conv_in", "conv_shortcut", "conv_out", "proj_out", "proj_in",
-                "ff.net.2", "ff.net.0.proj"]
-    for n, _ in unet.named_parameters():
-        if "bias" in n or "norm" in n:
-            continue
-        for pat in patterns:
-            if pat in n and ("down_blocks" in n or "conv_in" in n):
-                enc_mods.append(n.replace(".weight", "")); break
-            elif pat in n and "up_blocks" in n:
-                dec_mods.append(n.replace(".weight", "")); break
-            elif pat in n:
-                oth_mods.append(n.replace(".weight", "")); break
-
-    unet.add_adapter(LoraConfig(r=rank, init_lora_weights="gaussian",
-                                target_modules=enc_mods),
-                     adapter_name="default_encoder")
-    unet.add_adapter(LoraConfig(r=rank, init_lora_weights="gaussian",
-                                target_modules=dec_mods),
-                     adapter_name="default_decoder")
-    unet.add_adapter(LoraConfig(r=rank, init_lora_weights="gaussian",
-                                target_modules=oth_mods),
-                     adapter_name="default_others")
-
-    if return_lora_module_names:
-        return unet, enc_mods, dec_mods, oth_mods
-    return unet
+from modelfile.NAOSD import NAOSD
+from my_utils.training_utils_realsr import parse_args_realsr_training, PairedSROnlineDataset
 
 
 # ══════════════════════════════════════════════
-# FusionConditionAdapter
+# Loss functions（Mask-DiFuser Eq.14-17）
 # ══════════════════════════════════════════════
 
-class FusionConditionAdapter(nn.Module):
-    """
-    双路注入：
-      1. attention 路（原有）：fa/fb cross-attention，捕捉全局语义
-      2. direct 路（新增）：f_f pixel-aligned 直接投影到 UNet feature map
-         不经过 attention，强制空间结构对齐，解决形变/位移问题
+def loss_pixel(x_pred, x_gt):
+    return F.mse_loss(x_pred.float(), x_gt.float())
 
-    两路末层均 zero-init，训练初期 delta≈0，不扰动主干。
-    """
-    def __init__(self, channel_list, cond_ch: int = 128, ff_ch: int = 64):
+
+def loss_ssim(x_pred, x_gt):
+    x_pred = x_pred.float()
+    x_gt   = x_gt.float()
+    C1, C2 = 0.01**2, 0.03**2
+    mu_p  = F.avg_pool2d(x_pred, 11, 1, 5)
+    mu_g  = F.avg_pool2d(x_gt,   11, 1, 5)
+    mu_p2, mu_g2, mu_pg = mu_p*mu_p, mu_g*mu_g, mu_p*mu_g
+    sig_p2 = F.avg_pool2d(x_pred*x_pred, 11, 1, 5) - mu_p2
+    sig_g2 = F.avg_pool2d(x_gt  *x_gt,   11, 1, 5) - mu_g2
+    sig_pg = F.avg_pool2d(x_pred*x_gt,   11, 1, 5) - mu_pg
+    ssim_map = ((2*mu_pg+C1)*(2*sig_pg+C2)) / \
+               ((mu_p2+mu_g2+C1)*(sig_p2+sig_g2+C2))
+    return 1.0 - ssim_map.mean()
+
+
+class VGGPerceptual(nn.Module):
+    def __init__(self):
         super().__init__()
-        self.channel_list = channel_list
+        vgg = torchvision.models.vgg16(
+            weights=torchvision.models.VGG16_Weights.IMAGENET1K_V1)
+        self.slice1 = nn.Sequential(*list(vgg.features)[:4]).eval()
+        self.slice2 = nn.Sequential(*list(vgg.features)[4:9]).eval()
+        self.slice3 = nn.Sequential(*list(vgg.features)[9:16]).eval()
+        for p in self.parameters():
+            p.requires_grad = False
+        self.register_buffer("mean",
+            torch.tensor([0.485, 0.456, 0.406]).view(1,3,1,1))
+        self.register_buffer("std",
+            torch.tensor([0.229, 0.224, 0.225]).view(1,3,1,1))
 
-        self.ff_proj     = nn.ModuleList()
-        self.fa_attn     = nn.ModuleList()
-        self.fb_attn     = nn.ModuleList()
-        self.fuse        = nn.ModuleList()
-        self.direct_proj = nn.ModuleList()   # ← pixel-aligned 残差路
+    def forward(self, x_pred, x_gt):
+        x_pred = ((x_pred.float() + 1) / 2 - self.mean) / self.std
+        x_gt   = ((x_gt.float()   + 1) / 2 - self.mean) / self.std
+        loss = 0.0
+        for s in [self.slice1, self.slice2, self.slice3]:
+            x_pred = s(x_pred)
+            x_gt   = s(x_gt)
+            loss  += F.mse_loss(x_pred, x_gt)
+        return loss
 
-        for ch in channel_list:
-            g = min(32, ch)
 
-            # attention 路
-            self.ff_proj.append(nn.Sequential(
-                nn.Conv2d(ff_ch, ch, 1),
-                nn.GroupNorm(g, ch),
-                nn.SiLU(),
-            ))
-            self.fa_attn.append(CrossAttentionSpatial(ch, cond_ch))
-            self.fb_attn.append(CrossAttentionSpatial(ch, cond_ch))
-
-            fuse_block = nn.Sequential(
-                nn.Conv2d(ch * 4, ch, 3, 1, 1),
-                nn.GroupNorm(g, ch),
-                nn.SiLU(),
-                nn.Conv2d(ch, ch, 1),
-            )
-            nn.init.zeros_(fuse_block[-1].weight)
-            nn.init.zeros_(fuse_block[-1].bias)
-            self.fuse.append(fuse_block)
-
-            # direct 路：f_f → ch，pixel-aligned，zero-init
-            # 直接把 content feature 加到 UNet feature map，不经过 attention
-            # 强制空间结构保留，抑制形变
-            direct_block = nn.Sequential(
-                nn.Conv2d(ff_ch, ch, 3, 1, 1),
-                nn.GroupNorm(g, ch),
-                nn.SiLU(),
-                nn.Conv2d(ch, ch, 1),
-            )
-            nn.init.zeros_(direct_block[-1].weight)
-            nn.init.zeros_(direct_block[-1].bias)
-            self.direct_proj.append(direct_block)
-
-    def forward(self, h, idx, fa, fb, f_f):
-        H, W = h.shape[-2:]
-        ff_resized = F.interpolate(f_f, (H, W), mode="bilinear", align_corners=False)
-
-        # attention 路
-        ff         = self.ff_proj[idx](ff_resized)
-        za         = self.fa_attn[idx](h, fa)
-        zb         = self.fb_attn[idx](h, fb)
-        delta_attn = self.fuse[idx](torch.cat([h, ff, za, zb], dim=1))
-
-        # direct 路：pixel-aligned，防形变
-        delta_direct = self.direct_proj[idx](ff_resized)
-
-        return h + delta_attn + delta_direct
+def loss_color(x_pred, x_gt):
+    pred_norm = F.normalize(x_pred.float(), p=2, dim=1)
+    gt_norm   = F.normalize(x_gt.float(),   p=2, dim=1)
+    return (1.0 - F.cosine_similarity(pred_norm, gt_norm, dim=1)).mean()
 
 
 # ══════════════════════════════════════════════
-# NAOSD
+# 单次 DDIM 推理（可复用）
 # ══════════════════════════════════════════════
 
-class NAOSD(nn.Module):
-    def __init__(self, args):
-        super().__init__()
+@torch.no_grad()
+def _single_ddim_run(net, x_ir, x_vis, device, ddim, t_start):
+    """
+    从 VIS latent 加噪到 t_start，走 t<=t_start 的去噪步。
+    fusion 条件：IR=xA，VIS=xB。
 
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            args.pretrained_model_name_or_path, subfolder="tokenizer")
-        self.text_encoder = CLIPTextModel.from_pretrained(
-            args.pretrained_model_name_or_path, subfolder="text_encoder").cuda()
-        self.text_encoder.requires_grad_(False)
+    t_start 越大：接近纯噪声，IR 特征注入空间更大，但形变风险高
+    t_start 越小：VIS 结构保留越多，形变少，但 IR 特征越弱
 
-        self.sched  = make_1step_sched(args.pretrained_model_name_or_path)
-        self.sched2 = DDPMScheduler.from_pretrained(
-            args.pretrained_model_name_or_path, subfolder="scheduler")
-        self.args = args
+    注意：这里从 VIS latent 出发是合理的，因为：
+    - VIS latent 在 SD VAE 的分布内（IR latent 不在）
+    - t_start 大时（900+）加噪后几乎是纯噪声，与从 VIS 出发差异极小
+    - 不同 t_start 的对比图能清楚展示 IR 特征 vs 结构保留的 trade-off
+    """
+    latent = net.vae.encode(x_vis).latent_dist.sample()
+    latent = latent * net.vae.config.scaling_factor
+    noise  = torch.randn_like(latent)
+    latent = ddim.add_noise(latent, noise,
+                            torch.tensor([t_start], device=device))
 
-        self.semantic_encoder = SemanticEncoder(3, 128, 8, 4, dropout=0.1)
-        self.content_encoder  = ContentEncoder(3, 128, 64)
+    caption = net.encode_prompt([""])
+    fa, fb, f_f = net._extract_fusion_cond(x_ir, x_vis)
 
-        vae, lora_vae_enc, lora_vae_dec, lora_vae_oth = initialize_vae(
-            rank=args.lora_rank_vae,
-            pretrained_model_name_or_path=args.pretrained_model_name_or_path,
-            return_lora_module_names=True,
-        )
-        unet, lora_unet_enc, lora_unet_dec, lora_unet_oth = initialize_unet_sr(
-            rank=args.lora_rank_unet,
-            pretrained_model_name_or_path=args.pretrained_model_name_or_path,
-            return_lora_module_names=True,
-            args=args,
-        )
-        self.vae  = vae
-        self.unet = unet
+    for ts in ddim.timesteps:
+        if ts > t_start:
+            continue
+        lh, lw = latent.shape[-2:]
+        xa_lat = F.interpolate(x_ir,  (lh, lw), mode="bilinear", align_corners=False)
+        xb_lat = F.interpolate(x_vis, (lh, lw), mode="bilinear", align_corners=False)
+        unet_input = torch.cat([latent, xa_lat, xb_lat], dim=1)
+        t_tensor   = torch.tensor([ts], device=device).long()
+        noise_pred = net._unet_forward(unet_input, caption, fa, fb, f_f, t=t_tensor)
+        latent = ddim.step(noise_pred, ts, latent).prev_sample
 
-        self.lora_rank_vae  = args.lora_rank_vae
-        self.lora_rank_unet = args.lora_rank_unet
-        self.lora_vae_modules_encoder  = lora_vae_enc
-        self.lora_vae_modules_decoder  = lora_vae_dec
-        self.lora_vae_others           = lora_vae_oth
-        self.lora_unet_modules_encoder = lora_unet_enc
-        self.lora_unet_modules_decoder = lora_unet_dec
-        self.lora_unet_others          = lora_unet_oth
+    return net.vae.decode(
+        latent / net.vae.config.scaling_factor
+    ).sample.clamp(-1, 1)
 
-        channel_list = self._probe_channels()
-        self.cond_adapter = FusionConditionAdapter(
-            channel_list=channel_list, cond_ch=128, ff_ch=64)
 
-        if getattr(args, "pretrained_path", None) is not None:
-            print("==> loading pretrained:", args.pretrained_path)
-            sd = torch.load(args.pretrained_path, map_location="cpu")
-            self.load_ckpt_from_state_dict(sd)
+# ══════════════════════════════════════════════
+# 验证推理：同时保存三个 t_start 对比图
+# ══════════════════════════════════════════════
 
-        self.unet.cuda()
-        self.vae.cuda()
-        self.semantic_encoder.cuda()
-        self.content_encoder.cuda()
-        self.cond_adapter.cuda()
+def run_val_fusion(net_unwrapped, step, output_dir, device,
+                   val_ir_path, val_vis_path, ddim_steps=20):
+    """
+    同时生成 t_start = 300 / 600 / 900 三个版本：
+      t300：结构最稳，IR 特征最弱
+      t600：中间平衡点
+      t900：接近纯噪声，IR 特征最明显，形变风险最高
 
-        self.timesteps      = torch.tensor([args.time_step],       device="cuda").long()
-        self.timestepsnoise = torch.tensor([args.time_step_noise], device="cuda").long()
+    保存两种图：
+      1. fusion_step_{N}_t{T}.png：单独每个版本（IR | VIS | fusion）
+      2. fusion_step_{N}_compare.png：三版本横排对比（IR | VIS | t300 | t600 | t900）
+    """
+    if val_ir_path is None or val_vis_path is None:
+        return
+    if not (os.path.isfile(val_ir_path) and os.path.isfile(val_vis_path)):
+        print("[val] 找不到验证图，跳过")
+        return
 
-    @torch.no_grad()
-    def _probe_channels(self):
-        unet = self.unet
-        was_training = unet.training
-        unet.eval()
+    from diffusers import DDIMScheduler
 
-        dummy_input = torch.zeros(1, 10, 64, 64)
-        dummy_text  = torch.zeros(1, 77, 768)
-        sample = unet.conv_in(dummy_input)
-        t_emb  = unet.time_proj(torch.tensor([999]).long()).to(sample.dtype)
-        emb    = unet.time_embedding(t_emb)
-
-        channel_list = []
-        down_block_res = (sample,)
-
-        for down in unet.down_blocks:
-            if getattr(down, "has_cross_attention", False):
-                sample, res = down(hidden_states=sample, temb=emb,
-                                   encoder_hidden_states=dummy_text)
-            else:
-                sample, res = down(hidden_states=sample, temb=emb)
-            channel_list.append(sample.shape[1])
-            down_block_res += res
-
-        if unet.mid_block is not None:
-            sample = unet.mid_block(sample, emb, encoder_hidden_states=dummy_text)
-            channel_list.append(sample.shape[1])
-
-        for up in unet.up_blocks:
-            res = down_block_res[-len(up.resnets):]
-            down_block_res = down_block_res[:-len(up.resnets)]
-            if getattr(up, "has_cross_attention", False):
-                sample = up(hidden_states=sample, temb=emb,
-                            res_hidden_states_tuple=res,
-                            encoder_hidden_states=dummy_text)
-            else:
-                sample = up(hidden_states=sample, temb=emb,
-                            res_hidden_states_tuple=res)
-            channel_list.append(sample.shape[1])
-
-        print(f"[NAOSD] probe channels ({len(channel_list)} pts): {channel_list}")
-        if was_training:
-            unet.train()
-        return channel_list
-
-    def set_eval(self):
-        for m in [self.unet, self.vae, self.semantic_encoder,
-                  self.content_encoder, self.cond_adapter]:
-            m.eval()
-            m.requires_grad_(False)
-
-    def set_train(self):
-        self.unet.train()
-        self.vae.train()
-        self.semantic_encoder.train()
-        self.content_encoder.train()
-        self.cond_adapter.train()
-        for n, p in self.unet.named_parameters():
-            p.requires_grad = ("lora" in n or "conv_in" in n)
-        for n, p in self.vae.named_parameters():
-            p.requires_grad = ("lora" in n)
-        for m in [self.semantic_encoder, self.content_encoder, self.cond_adapter]:
-            for p in m.parameters():
-                p.requires_grad = True
-
-    @torch.no_grad()
-    def encode_prompt(self, prompt):
-        ids = self.tokenizer(
-            prompt,
-            max_length=self.tokenizer.model_max_length,
-            padding="max_length",
-            truncation=True,
-            return_tensors="pt",
-        ).input_ids
-        return self.text_encoder(ids.to(self.text_encoder.device))[0]
-
-    def _extract_fusion_cond(self, xA, xB):
-        fa  = self.semantic_encoder(xA)
-        fb  = self.semantic_encoder(xB)
-        f_f = self.content_encoder(xA, xB)
-        return fa, fb, f_f
-
-    def _unet_forward(self, unet_input, caption_enc, fa, fb, f_f, t=None):
-        """t: LongTensor(B,) 或 (1,)，None 时用 self.timesteps"""
-        if t is None:
-            t = self.timesteps
-
-        unet   = self.unet
-        sample = unet.conv_in(unet_input)
-
-        if t.shape[0] == sample.shape[0]:
-            t_emb = unet.time_proj(t).to(sample.dtype)
-            emb   = unet.time_embedding(t_emb)
-        else:
-            t_emb = unet.time_proj(t[:1]).to(sample.dtype)
-            emb   = unet.time_embedding(t_emb).expand(sample.shape[0], -1)
-
-        enc_hs = caption_enc.to(sample.dtype)
-
-        adapter_idx = 0
-        down_block_res = (sample,)
-
-        for down in unet.down_blocks:
-            if getattr(down, "has_cross_attention", False):
-                sample, res = down(hidden_states=sample, temb=emb,
-                                   encoder_hidden_states=enc_hs)
-            else:
-                sample, res = down(hidden_states=sample, temb=emb)
-            sample = self.cond_adapter(sample, adapter_idx, fa, fb, f_f)
-            adapter_idx += 1
-            down_block_res += res
-
-        if unet.mid_block is not None:
-            sample = unet.mid_block(sample, emb, encoder_hidden_states=enc_hs)
-            sample = self.cond_adapter(sample, adapter_idx, fa, fb, f_f)
-            adapter_idx += 1
-
-        for up in unet.up_blocks:
-            res = down_block_res[-len(up.resnets):]
-            down_block_res = down_block_res[:-len(up.resnets)]
-            if getattr(up, "has_cross_attention", False):
-                sample = up(hidden_states=sample, temb=emb,
-                            res_hidden_states_tuple=res,
-                            encoder_hidden_states=enc_hs)
-            else:
-                sample = up(hidden_states=sample, temb=emb,
-                            res_hidden_states_tuple=res)
-            sample = self.cond_adapter(sample, adapter_idx, fa, fb, f_f)
-            adapter_idx += 1
-
-        if unet.conv_norm_out is not None:
-            sample = unet.conv_norm_out(sample)
-            sample = unet.conv_act(sample)
-        return unet.conv_out(sample)
-
-    def forward_train(self, x0, xA, xB, t=None):
-        """
-        Mask-DiFuser 训练范式（Eq.12-18）
-        返回 (eps_pred, eps_target, x0_hat, t)
-        t 返回给训练脚本用于计算 t_weight（大 t 降低像素级 loss 权重）
-        """
-        B = x0.shape[0]
-
+    net_unwrapped.set_eval()
+    try:
         with torch.no_grad():
-            latent_x0 = (self.vae.encode(x0).latent_dist.sample()
-                         * self.vae.config.scaling_factor)
+            def load_img(path):
+                img = Image.open(path).convert("RGB").resize((512, 512), Image.LANCZOS)
+                t = TF.to_tensor(img)
+                return TF.normalize(t, [0.5]*3, [0.5]*3).unsqueeze(0).to(device)
 
-        if t is None:
-            t = torch.randint(
-                0, self.sched2.config.num_train_timesteps,
-                (B,), device=x0.device
-            ).long()
+            x_ir  = load_img(val_ir_path)
+            x_vis = load_img(val_vis_path)
 
-        eps = torch.randn_like(latent_x0)
-        xt  = self.sched2.add_noise(latent_x0, eps, t)
+            ddim = DDIMScheduler.from_pretrained(
+                net_unwrapped.args.pretrained_model_name_or_path,
+                subfolder="scheduler")
+            ddim.set_timesteps(ddim_steps, device=device)
 
-        fa, fb, f_f = self._extract_fusion_cond(xA, xB)
+            outputs = {}
+            for t_val in [300, 600, 900]:
+                out = _single_ddim_run(
+                    net_unwrapped, x_ir, x_vis, device, ddim, t_start=t_val)
+                outputs[t_val] = out.cpu()
 
-        lh, lw = xt.shape[-2:]
-        xa_lat = F.interpolate(xA, (lh, lw), mode="bilinear", align_corners=False)
-        xb_lat = F.interpolate(xB, (lh, lw), mode="bilinear", align_corners=False)
-        unet_input  = torch.cat([xt, xa_lat, xb_lat], dim=1)
-        caption_enc = self.encode_prompt([""] * B)
-        eps_pred    = self._unet_forward(unet_input, caption_enc, fa, fb, f_f, t=t)
+                # 单独保存：IR | VIS | fusion
+                grid_single = torch.cat(
+                    [x_ir.cpu(), x_vis.cpu(), out.cpu()], dim=-1)
+                save_image(
+                    (grid_single + 1) / 2,
+                    os.path.join(output_dir, "eval",
+                                 f"fusion_step_{step:06d}_t{t_val}.png"),
+                )
 
-        # predict_x0_from_noise，clamp 防大 t 数值爆炸
-        alphas_cumprod = self.sched2.alphas_cumprod.to(x0.device)
-        alpha_t = alphas_cumprod[t].float()
-        while alpha_t.dim() < latent_x0.dim():
-            alpha_t = alpha_t.unsqueeze(-1)
+            # 横排对比：IR | VIS | t300 | t600 | t900
+            grid_compare = torch.cat(
+                [x_ir.cpu(), x_vis.cpu(),
+                 outputs[300], outputs[600], outputs[900]],
+                dim=-1
+            )
+            save_path = os.path.join(output_dir, "eval",
+                                     f"fusion_step_{step:06d}_compare.png")
+            save_image((grid_compare + 1) / 2, save_path)
+            print(f"[val] saved compare → {save_path}")
+            print(f"      列顺序：IR | VIS | t300(稳) | t600(中) | t900(IR强)")
 
-        x0_hat_lat = (xt.float() - (1 - alpha_t).sqrt() * eps_pred.float()) \
-                     / alpha_t.sqrt()
-        x0_hat_lat = x0_hat_lat.clamp(-5, 5)
+    except Exception as e:
+        import traceback
+        print(f"[val] failed at step {step}: {e}")
+        traceback.print_exc()
 
-        x0_hat = self.vae.decode(
-            x0_hat_lat / self.vae.config.scaling_factor
-        ).sample.clamp(-1, 1)
+    net_unwrapped.set_train()
 
-        return eps_pred, eps, x0_hat, t
 
-    def forward(self, c_t, positive_prompt=None, negative_prompt=None,
-                args=None, extra_cond=None):
-        """one-step 推理接口，保持不变"""
-        caption_enc     = self.encode_prompt(positive_prompt)
-        neg_caption_enc = self.encode_prompt(negative_prompt)
+# ══════════════════════════════════════════════
+# main
+# ══════════════════════════════════════════════
 
-        latent       = (self.vae.encode(c_t).latent_dist.sample()
-                        * self.vae.config.scaling_factor)
-        noise        = torch.randn_like(latent)
-        latent_noisy = self.sched2.add_noise(latent, noise, self.timestepsnoise)
+def main(args):
+    if args.report_to == "wandb":
+        wandb.login()
 
-        xA = extra_cond[:, :3]
-        xB = extra_cond[:, 3:6]
-        fa, fb, f_f = self._extract_fusion_cond(xA, xB)
+    logging_dir = Path(args.output_dir, args.logging_dir)
+    accelerator_project_config = ProjectConfiguration(
+        project_dir=args.output_dir, logging_dir=logging_dir)
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
 
-        lh, lw = latent_noisy.shape[-2:]
-        xa_lat = F.interpolate(xA, (lh, lw), mode="bilinear", align_corners=False)
-        xb_lat = F.interpolate(xB, (lh, lw), mode="bilinear", align_corners=False)
-        unet_input = torch.cat([latent_noisy, xa_lat, xb_lat], dim=1)
+    accelerator = Accelerator(
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        mixed_precision=args.mixed_precision,
+        log_with=args.report_to,
+        project_config=accelerator_project_config,
+        kwargs_handlers=[ddp_kwargs],
+    )
 
-        model_pred = self._unet_forward(unet_input, caption_enc, fa, fb, f_f, t=None)
-        x_denoised = self.sched.step(
-            model_pred, self.timesteps, latent_noisy, return_dict=True
-        ).prev_sample
-        output_image = self.vae.decode(
-            x_denoised / self.vae.config.scaling_factor
-        ).sample.clamp(-1, 1)
+    if accelerator.is_local_main_process:
+        transformers.utils.logging.set_verbosity_warning()
+        diffusers.utils.logging.set_verbosity_info()
+    else:
+        transformers.utils.logging.set_verbosity_error()
+        diffusers.utils.logging.set_verbosity_error()
 
-        return output_image, x_denoised, caption_enc, neg_caption_enc, noise
+    if args.seed is not None:
+        set_seed(args.seed)
 
-    def save_model(self, outf: str):
-        sd = {
-            "rank_unet": self.lora_rank_unet,
-            "rank_vae":  self.lora_rank_vae,
-            "vae_lora_encoder_modules":  self.lora_vae_modules_encoder,
-            "vae_lora_decoder_modules":  self.lora_vae_modules_decoder,
-            "vae_lora_others_modules":   self.lora_vae_others,
-            "unet_lora_encoder_modules": self.lora_unet_modules_encoder,
-            "unet_lora_decoder_modules": self.lora_unet_modules_decoder,
-            "unet_lora_others_modules":  self.lora_unet_others,
-            "adapter_channel_list": self.cond_adapter.channel_list,
-            "state_dict_unet": {
-                k: v for k, v in self.unet.state_dict().items()
-                if "lora" in k or "conv_in" in k
-            },
-            "state_dict_vae": {
-                k: v for k, v in self.vae.state_dict().items()
-                if "lora" in k
-            },
-            "state_dict_semantic_encoder": self.semantic_encoder.state_dict(),
-            "state_dict_content_encoder":  self.content_encoder.state_dict(),
-            "state_dict_cond_adapter":     self.cond_adapter.state_dict(),
-        }
-        torch.save(sd, outf)
-        print(f"[NAOSD] saved → {outf}")
+    if accelerator.is_main_process:
+        os.makedirs(os.path.join(args.output_dir, "checkpoints"), exist_ok=True)
+        os.makedirs(os.path.join(args.output_dir, "eval"), exist_ok=True)
 
-    def load_ckpt_from_state_dict(self, sd: dict):
-        if not (hasattr(self.unet, "peft_config") and self.unet.peft_config):
-            self.unet.add_adapter(
-                LoraConfig(r=sd["rank_unet"], init_lora_weights="gaussian",
-                           target_modules=sd["unet_lora_encoder_modules"]),
-                adapter_name="default_encoder")
-            self.unet.add_adapter(
-                LoraConfig(r=sd["rank_unet"], init_lora_weights="gaussian",
-                           target_modules=sd["unet_lora_decoder_modules"]),
-                adapter_name="default_decoder")
-            self.unet.add_adapter(
-                LoraConfig(r=sd["rank_unet"], init_lora_weights="gaussian",
-                           target_modules=sd["unet_lora_others_modules"]),
-                adapter_name="default_others")
-        if "state_dict_unet" in sd:
-            for n, p in self.unet.named_parameters():
-                if n in sd["state_dict_unet"]:
-                    p.data.copy_(sd["state_dict_unet"][n])
+    VAL_IR_PATH  = "/private/home/wuhao/dnj/data/M3FD/Ir/00000.png"
+    VAL_VIS_PATH = "/private/home/wuhao/dnj/data/M3FD/Vis/00000.png"
 
-        if not (hasattr(self.vae, "peft_config") and self.vae.peft_config):
-            self.vae.add_adapter(
-                LoraConfig(r=sd["rank_vae"], init_lora_weights="gaussian",
-                           target_modules=sd["vae_lora_encoder_modules"]),
-                adapter_name="default_encoder")
-            self.vae.add_adapter(
-                LoraConfig(r=sd["rank_vae"], init_lora_weights="gaussian",
-                           target_modules=sd["vae_lora_decoder_modules"]),
-                adapter_name="default_decoder")
-        if "state_dict_vae" in sd:
-            for n, p in self.vae.named_parameters():
-                if n in sd["state_dict_vae"]:
-                    p.data.copy_(sd["state_dict_vae"][n])
+    # ── 模型 ────────────────────────────────────
+    net = NAOSD(args=args)
+    net.set_train()
 
-        for key, mod in [
-            ("state_dict_semantic_encoder", self.semantic_encoder),
-            ("state_dict_content_encoder",  self.content_encoder),
-            ("state_dict_cond_adapter",     self.cond_adapter),
-        ]:
-            if key in sd:
-                mod.load_state_dict(sd[key], strict=True)
+    if args.enable_xformers_memory_efficient_attention:
+        if is_xformers_available():
+            net.unet.enable_xformers_memory_efficient_attention()
+        else:
+            raise ValueError("xformers not available")
+
+    if args.gradient_checkpointing:
+        net.unet.enable_gradient_checkpointing()
+
+    if args.allow_tf32:
+        torch.backends.cuda.matmul.allow_tf32 = True
+
+    # ── VAE adapter ─────────────────────────────
+    if args.use_vae_encode_lora and args.use_vae_decode_lora:
+        net.vae.set_adapter(["default_encoder", "default_decoder"])
+    elif args.use_vae_encode_lora:
+        net.vae.set_adapter(["default_encoder"])
+    elif args.use_vae_decode_lora:
+        net.vae.set_adapter(["default_decoder"])
+    else:
+        if hasattr(net.vae, "peft_config") and net.vae.peft_config:
+            net.vae.disable_adapters()
+    net.unet.set_adapter(["default_encoder", "default_decoder", "default_others"])
+
+    # ── 感知损失 ─────────────────────────────────
+    vgg_loss = VGGPerceptual().cuda()
+
+    # ── optimizer ───────────────────────────────
+    layers_to_opt = [p for p in net.parameters() if p.requires_grad]
+    print(f"[optimizer] trainable params: {sum(p.numel() for p in layers_to_opt):,}")
+
+    optimizer = torch.optim.AdamW(
+        layers_to_opt,
+        lr=args.learning_rate,
+        betas=(args.adam_beta1, args.adam_beta2),
+        weight_decay=args.adam_weight_decay,
+        eps=args.adam_epsilon,
+    )
+    lr_scheduler = get_scheduler(
+        args.lr_scheduler, optimizer=optimizer,
+        num_warmup_steps=args.lr_warmup_steps * accelerator.num_processes,
+        num_training_steps=args.max_train_steps * accelerator.num_processes,
+        num_cycles=args.lr_num_cycles, power=args.lr_power,
+    )
+
+    # ── dataset ─────────────────────────────────
+    dataset_train = PairedSROnlineDataset(
+        dataset_folder=args.dataset_folder,
+        image_prep=args.train_image_prep,
+        split="train",
+        deg_file_path=args.deg_file_path,
+        args=args,
+    )
+    dl_train = torch.utils.data.DataLoader(
+        dataset_train,
+        batch_size=args.train_batch_size,
+        shuffle=True,
+        num_workers=args.dataloader_num_workers,
+        pin_memory=True,
+        drop_last=True,
+        persistent_workers=(args.dataloader_num_workers > 0),
+    )
+
+    net, optimizer, dl_train, lr_scheduler = accelerator.prepare(
+        net, optimizer, dl_train, lr_scheduler)
+    vgg_loss = accelerator.prepare(vgg_loss)
+
+    if accelerator.is_main_process:
+        accelerator.init_trackers(args.tracker_project_name, config=dict(vars(args)))
+
+    progress_bar = tqdm(range(args.max_train_steps), desc="Steps",
+                        disable=not accelerator.is_local_main_process)
+
+    # ── 损失权重（Mask-DiFuser Eq.18）────────────
+    lambda_diff = 1.0
+    lambda_pix  = 0.05
+    lambda_ssim = 0.05
+    lambda_per  = 0.1
+    lambda_col  = 1.0
+
+    global_step = 0
+    nan_count   = 0
+    train_iter  = iter(dl_train)
+
+    while global_step < args.max_train_steps:
+
+        try:
+            batch = next(train_iter)
+        except StopIteration:
+            train_iter = iter(dl_train)
+            batch = next(train_iter)
+
+        with accelerator.accumulate(net):
+
+            x_tgt = batch["HR"]
+            xA    = batch["LR_A"]
+            xB    = batch["LR_B"]
+
+            # forward_train 返回 (eps_pred, eps_target, x0_hat, t)
+            eps_pred, eps_target, x0_hat, t_used = \
+                accelerator.unwrap_model(net).forward_train(
+                    x0=x_tgt, xA=xA, xB=xB
+                )
+
+            # t_weight：大 t 时 x̂0 不准，降低像素级 loss 权重
+            t_weight = (1.0 - t_used.float() / 1000.0).clamp(0.1, 1.0).mean()
+
+            l_diff = F.mse_loss(eps_pred.float(), eps_target.float())
+            l_pix  = loss_pixel(x0_hat, x_tgt)
+            l_ssim = loss_ssim(x0_hat, x_tgt)
+            l_per  = vgg_loss(x0_hat, x_tgt)
+            l_col  = loss_color(x0_hat, x_tgt)
+
+            loss = (lambda_diff * l_diff +
+                    t_weight * (lambda_pix  * l_pix  +
+                                lambda_ssim * l_ssim +
+                                lambda_per  * l_per  +
+                                lambda_col  * l_col))
+
+            if not torch.isfinite(loss):
+                nan_count += 1
+                print(f"[step {global_step}] non-finite loss ({nan_count}/50), skip")
+                optimizer.zero_grad(set_to_none=args.set_grads_to_none)
+                if nan_count >= 50:
+                    print("Too many non-finite losses, aborting.")
+                    break
+                continue
+            nan_count = 0
+
+            accelerator.backward(loss)
+            if accelerator.sync_gradients:
+                accelerator.clip_grad_norm_(layers_to_opt, args.max_grad_norm)
+            optimizer.step()
+            lr_scheduler.step()
+            optimizer.zero_grad(set_to_none=args.set_grads_to_none)
+
+        if accelerator.sync_gradients:
+            progress_bar.update(1)
+            global_step += 1
+
+            if accelerator.is_main_process:
+                logs = {
+                    "loss":      loss.detach().item(),
+                    "loss_diff": l_diff.detach().item(),
+                    "loss_pix":  l_pix.detach().item(),
+                    "loss_ssim": l_ssim.detach().item(),
+                    "loss_per":  l_per.detach().item(),
+                    "loss_col":  l_col.detach().item(),
+                    "t_weight":  t_weight.detach().item(),
+                    "lr":        lr_scheduler.get_last_lr()[0],
+                }
+                progress_bar.set_postfix(
+                    loss=f"{loss.item():.3f}",
+                    col=f"{l_col.item():.3f}",
+                    tw=f"{t_weight.item():.2f}",
+                )
+                accelerator.log(logs, step=global_step)
+
+                if global_step % args.checkpointing_steps == 0:
+
+                    # adapter 权重监控
+                    try:
+                        adapter_w = accelerator.unwrap_model(net) \
+                            .cond_adapter.fuse[4][-1].weight.abs().mean().item()
+                        print(f"[step {global_step}] adapter_w={adapter_w:.6f}")
+                        accelerator.log({"adapter_w": adapter_w}, step=global_step)
+                    except Exception:
+                        pass
+
+                    # 训练预览：masked_A | x̂0 | GT
+                    train_vis = torch.cat([
+                        xA[:1].detach().cpu().float(),
+                        x0_hat[:1].detach().cpu().float(),
+                        x_tgt[:1].detach().cpu().float(),
+                    ], dim=-1)
+                    save_image(
+                        (train_vis.clamp(-1, 1) + 1) / 2,
+                        os.path.join(args.output_dir, "eval",
+                                     f"train_step_{global_step:06d}.png"),
+                    )
+
+                    # 三 t_start 对比验证图
+                    run_val_fusion(
+                        net_unwrapped=accelerator.unwrap_model(net),
+                        step=global_step,
+                        output_dir=args.output_dir,
+                        device=accelerator.device,
+                        val_ir_path=VAL_IR_PATH,
+                        val_vis_path=VAL_VIS_PATH,
+                        ddim_steps=20,
+                    )
+
+                    outf = os.path.join(args.output_dir, "checkpoints",
+                                        f"model_{global_step:06d}.pkl")
+                    accelerator.unwrap_model(net).save_model(outf)
+
+    if accelerator.is_main_process:
+        save_path = os.path.join(args.output_dir, "checkpoints", "model_final.pkl")
+        accelerator.unwrap_model(net).save_model(save_path)
+        print("Saved final model →", save_path)
+
+    accelerator.end_training()
+
+
+if __name__ == "__main__":
+    args = parse_args_realsr_training()
+    main(args)
