@@ -105,10 +105,15 @@ def initialize_unet_sr(rank, return_lora_module_names=False,
 
 
 # ══════════════════════════════════════════════
-# FusionConditionAdapter
+# FusionConditionAdapter（无 direct_proj）
 # ══════════════════════════════════════════════
 
 class FusionConditionAdapter(nn.Module):
+    """
+    单路注入：attention 路（fa/fb cross-attention + f_f content）
+    不含 direct_proj：在训练步数不足时 direct_proj 会引入未训练好的偏置，
+    导致 IR 特征丢失、图像偏暗，步数充足后可再考虑加入。
+    """
     def __init__(self, channel_list, cond_ch: int = 128, ff_ch: int = 64):
         super().__init__()
         self.channel_list = channel_list
@@ -140,10 +145,10 @@ class FusionConditionAdapter(nn.Module):
 
     def forward(self, h, idx, fa, fb, f_f):
         H, W = h.shape[-2:]
-        ff   = F.interpolate(f_f, (H, W), mode="bilinear", align_corners=False)
-        ff   = self.ff_proj[idx](ff)
-        za   = self.fa_attn[idx](h, fa)
-        zb   = self.fb_attn[idx](h, fb)
+        ff    = F.interpolate(f_f, (H, W), mode="bilinear", align_corners=False)
+        ff    = self.ff_proj[idx](ff)
+        za    = self.fa_attn[idx](h, fa)
+        zb    = self.fb_attn[idx](h, fb)
         delta = self.fuse[idx](torch.cat([h, ff, za, zb], dim=1))
         return h + delta
 
@@ -208,13 +213,9 @@ class NAOSD(nn.Module):
         self.content_encoder.cuda()
         self.cond_adapter.cuda()
 
-        # default timesteps for one-step inference
         self.timesteps      = torch.tensor([args.time_step],       device="cuda").long()
         self.timestepsnoise = torch.tensor([args.time_step_noise], device="cuda").long()
 
-    # ──────────────────────────────────────────
-    # probe
-    # ──────────────────────────────────────────
     @torch.no_grad()
     def _probe_channels(self):
         unet = self.unet
@@ -223,7 +224,6 @@ class NAOSD(nn.Module):
 
         dummy_input = torch.zeros(1, 10, 64, 64)
         dummy_text  = torch.zeros(1, 77, 768)
-
         sample = unet.conv_in(dummy_input)
         t_emb  = unet.time_proj(torch.tensor([999]).long()).to(sample.dtype)
         emb    = unet.time_embedding(t_emb)
@@ -261,10 +261,6 @@ class NAOSD(nn.Module):
             unet.train()
         return channel_list
 
-    # ──────────────────────────────────────────
-    # train / eval
-    # ──────────────────────────────────────────
-
     def set_eval(self):
         for m in [self.unet, self.vae, self.semantic_encoder,
                   self.content_encoder, self.cond_adapter]:
@@ -285,10 +281,6 @@ class NAOSD(nn.Module):
             for p in m.parameters():
                 p.requires_grad = True
 
-    # ──────────────────────────────────────────
-    # encode_prompt
-    # ──────────────────────────────────────────
-
     @torch.no_grad()
     def encode_prompt(self, prompt):
         ids = self.tokenizer(
@@ -300,38 +292,24 @@ class NAOSD(nn.Module):
         ).input_ids
         return self.text_encoder(ids.to(self.text_encoder.device))[0]
 
-    # ──────────────────────────────────────────
-    # _extract_fusion_cond
-    # ──────────────────────────────────────────
-
     def _extract_fusion_cond(self, xA, xB):
-        """从 xA, xB 提取 fa, fb, f_f"""
         fa  = self.semantic_encoder(xA)
         fb  = self.semantic_encoder(xB)
         f_f = self.content_encoder(xA, xB)
         return fa, fb, f_f
 
-    # ──────────────────────────────────────────
-    # _unet_forward  ← 支持任意时间步 t
-    # ──────────────────────────────────────────
-
     def _unet_forward(self, unet_input, caption_enc, fa, fb, f_f, t=None):
-        """
-        t: LongTensor (B,) 或 (1,)
-           训练时传随机时间步；推理时传 None，内部用 self.timesteps
-        """
+        """t: LongTensor(B,) 或 (1,)，None 时用 self.timesteps"""
         if t is None:
             t = self.timesteps
 
         unet   = self.unet
         sample = unet.conv_in(unet_input)
 
-        # time embedding 支持 batch 维或单值
         if t.shape[0] == sample.shape[0]:
-            t_emb = unet.time_proj(t).to(sample.dtype)          # (B, 320)
-            emb   = unet.time_embedding(t_emb)                   # (B, 1280)
+            t_emb = unet.time_proj(t).to(sample.dtype)
+            emb   = unet.time_embedding(t_emb)
         else:
-            # 单个时间步，广播
             t_emb = unet.time_proj(t[:1]).to(sample.dtype)
             emb   = unet.time_embedding(t_emb).expand(sample.shape[0], -1)
 
@@ -373,92 +351,62 @@ class NAOSD(nn.Module):
             sample = unet.conv_act(sample)
         return unet.conv_out(sample)
 
-    # ──────────────────────────────────────────
-    # forward_train  ← Mask-DiFuser 真正训练范式
-    # ──────────────────────────────────────────
-
     def forward_train(self, x0, xA, xB, t=None):
         """
-        Mask-DiFuser 训练范式（Eq.12-18）：
-          - x0:  GT 图像 (B,3,H,W), [-1,1]
-          - xA/xB: 两路互补 masked 图，作为 conditioning
-          - t:   时间步 LongTensor (B,)，None 时随机采样
-
-        返回：
-          eps_pred   - UNet 预测的噪声 (B,4,h,w)
-          eps_target - 加入的真实噪声 (B,4,h,w)
-          x0_hat     - 从噪声预测反推的 x0，在像素空间 [-1,1]（用于 L_pix/L_ssim/L_per/L_col）
-          latent_x0  - GT 的 latent（调试用）
+        Mask-DiFuser 训练范式（Eq.12-18）
+        返回 (eps_pred, eps_target, x0_hat, t)
+        注意：返回 t 而非 latent_x0，供训练脚本计算 t_weight
         """
         B = x0.shape[0]
 
-        # 1. Encode GT → latent
         with torch.no_grad():
             latent_x0 = (self.vae.encode(x0).latent_dist.sample()
                          * self.vae.config.scaling_factor)
 
-        # 2. 随机时间步
         if t is None:
             t = torch.randint(
                 0, self.sched2.config.num_train_timesteps,
                 (B,), device=x0.device
             ).long()
 
-        # 3. 前向加噪
         eps = torch.randn_like(latent_x0)
         xt  = self.sched2.add_noise(latent_x0, eps, t)
 
-        # 4. 提取 fusion 条件（来自 masked 输入，不是 GT）
         fa, fb, f_f = self._extract_fusion_cond(xA, xB)
 
-        # 5. 构造 UNet 输入：[xt(4ch) | xA_resized(3ch) | xB_resized(3ch)]
         lh, lw = xt.shape[-2:]
         xa_lat = F.interpolate(xA, (lh, lw), mode="bilinear", align_corners=False)
         xb_lat = F.interpolate(xB, (lh, lw), mode="bilinear", align_corners=False)
-        unet_input = torch.cat([xt, xa_lat, xb_lat], dim=1)   # (B,10,h,w)
-
-        # 6. text embedding（空 prompt）
+        unet_input  = torch.cat([xt, xa_lat, xb_lat], dim=1)
         caption_enc = self.encode_prompt([""] * B)
+        eps_pred    = self._unet_forward(unet_input, caption_enc, fa, fb, f_f, t=t)
 
-        # 7. UNet 预测噪声（传入随机 t）
-        eps_pred = self._unet_forward(unet_input, caption_enc, fa, fb, f_f, t=t)
-
-        # 8. predict_x0_from_noise（Eq.13）
-        #    x̂0 = (xt - sqrt(1-ᾱt) * eps_pred) / sqrt(ᾱt)
-        #    clamp(-5,5) 防止大时间步数值爆炸
+        # predict_x0_from_noise，clamp 防大 t 数值爆炸
         alphas_cumprod = self.sched2.alphas_cumprod.to(x0.device)
-        alpha_t = alphas_cumprod[t].float()                # (B,)
+        alpha_t = alphas_cumprod[t].float()
         while alpha_t.dim() < latent_x0.dim():
-            alpha_t = alpha_t.unsqueeze(-1)                # (B,1,1,1)
+            alpha_t = alpha_t.unsqueeze(-1)
 
         x0_hat_lat = (xt.float() - (1 - alpha_t).sqrt() * eps_pred.float()) \
                      / alpha_t.sqrt()
         x0_hat_lat = x0_hat_lat.clamp(-5, 5)
 
-        # 9. Decode → 像素空间
         x0_hat = self.vae.decode(
             x0_hat_lat / self.vae.config.scaling_factor
         ).sample.clamp(-1, 1)
 
-        return eps_pred, eps, x0_hat, latent_x0
-
-    # ──────────────────────────────────────────
-    # forward  ← one-step 推理接口（保持原签名）
-    # ──────────────────────────────────────────
+        # 返回 t（不是 latent_x0），供训练脚本计算 t_weight
+        return eps_pred, eps, x0_hat, t
 
     def forward(self, c_t, positive_prompt=None, negative_prompt=None,
                 args=None, extra_cond=None):
-        """
-        推理/验证用：one-step。
-        c_t: VIS 图（或 GT）作为 VAE encode 起点
-        extra_cond: (B,6,H,W) = [xA | xB]
-        """
+        """one-step 推理接口，保持不变"""
         caption_enc     = self.encode_prompt(positive_prompt)
         neg_caption_enc = self.encode_prompt(negative_prompt)
 
-        latent      = (self.vae.encode(c_t).latent_dist.sample()
-                       * self.vae.config.scaling_factor)
-        noise       = torch.randn_like(latent)
+        latent       = (self.vae.encode(c_t).latent_dist.sample()
+                        * self.vae.config.scaling_factor)
+        noise        = torch.randn_like(latent)
         latent_noisy = self.sched2.add_noise(latent, noise, self.timestepsnoise)
 
         xA = extra_cond[:, :3]
@@ -470,22 +418,15 @@ class NAOSD(nn.Module):
         xb_lat = F.interpolate(xB, (lh, lw), mode="bilinear", align_corners=False)
         unet_input = torch.cat([latent_noisy, xa_lat, xb_lat], dim=1)
 
-        # 推理：t=None → 内部用 self.timesteps
         model_pred = self._unet_forward(unet_input, caption_enc, fa, fb, f_f, t=None)
-
         x_denoised = self.sched.step(
             model_pred, self.timesteps, latent_noisy, return_dict=True
         ).prev_sample
-
         output_image = self.vae.decode(
             x_denoised / self.vae.config.scaling_factor
         ).sample.clamp(-1, 1)
 
         return output_image, x_denoised, caption_enc, neg_caption_enc, noise
-
-    # ──────────────────────────────────────────
-    # save / load
-    # ──────────────────────────────────────────
 
     def save_model(self, outf: str):
         sd = {
@@ -514,7 +455,6 @@ class NAOSD(nn.Module):
         print(f"[NAOSD] saved → {outf}")
 
     def load_ckpt_from_state_dict(self, sd: dict):
-        # UNet LoRA
         if not (hasattr(self.unet, "peft_config") and self.unet.peft_config):
             self.unet.add_adapter(
                 LoraConfig(r=sd["rank_unet"], init_lora_weights="gaussian",
@@ -533,7 +473,6 @@ class NAOSD(nn.Module):
                 if n in sd["state_dict_unet"]:
                     p.data.copy_(sd["state_dict_unet"][n])
 
-        # VAE LoRA
         if not (hasattr(self.vae, "peft_config") and self.vae.peft_config):
             self.vae.add_adapter(
                 LoraConfig(r=sd["rank_vae"], init_lora_weights="gaussian",
@@ -548,7 +487,6 @@ class NAOSD(nn.Module):
                 if n in sd["state_dict_vae"]:
                     p.data.copy_(sd["state_dict_vae"][n])
 
-        # Fusion modules
         for key, mod in [
             ("state_dict_semantic_encoder", self.semantic_encoder),
             ("state_dict_content_encoder",  self.content_encoder),
